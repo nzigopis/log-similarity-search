@@ -16,6 +16,7 @@ AZURE_SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 SEARCH_INDEX_NAME = os.getenv("SEARCH_INDEX_NAME", "log-file-errors")
+LOG_FILE = os.getenv("LOG_FILE")
 
 # Validate required environment variables
 if not AZURE_SEARCH_KEY:
@@ -37,33 +38,55 @@ client = EmbeddingsClient(
 )
 
 class LogEntry:
-    def __init__(self, timestamp, level, instrument_id, message):
+    def __init__(self, timestamp, level, instrument_id, message, full_log_text, message_id):
         self.timestamp = timestamp
         self.level = level
         self.instrument_id = instrument_id
         self.message = message
+        self.full_log_text = full_log_text
+        self.message_id = message_id
 
 
 class InstrumentLogAnalyzer:
     def __init__(self):
-        self.chunk_size = 7  # 5-10 log entries per chunk
+        self.chunk_size = 1  # log entries per chunk
 
-    def parse_log_line(self, line):
+    def extract_log_entry(self, line):
         """Parse individual log line into structured format"""
-        # Example log format: 2024-06-01 10:30:15 [ERROR] TEMP_001: Temperature sensor reading invalid: -999.0°C
-        pattern = r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (\w+): (.+)'
-        match = re.match(pattern, line.strip())
+        
+        pattern = (
+            r'MsgID="(?P<MsgID>[^"]+)"\s+' 
+            r'TimeStamp="(?P<TimeStamp>[^"]+)"\s+'  # TimeStamp field
+            r'Channel="(?P<Channel>[^"]+)"\s+'      # Channel field
+            r'Type="(?P<Type>[^"]+)"\s+'            # Type field
+            r'Severity="(?P<Severity>[^"]+)"\s+'    # Severity field
+            # r'Message="(?P<Message>.*?)(?=(?:\s*at\s+[^"]+.*?){2})'
+            r'Message="(?P<Message>[^"]+?)"\s*'     # Matches Message up to the next tag
+            # r'(?:<Exception>\s*<!\[CDATA\[(?P<Exception>.*?)\]\]>\s*</Exception>)?'  # Matches optional Exception tag
+            # r'Message="(?P<Message>[^"]+.[^<]*)"\s*' # Message field up to <Exception>
+            # r'<Exception>\s*<!\[CDATA\[(?P<Exception>.*?)\]\]>'  # Exception block
+        )
+        
+        match = re.search(pattern, line, re.DOTALL)
 
         if match:
-            timestamp, level, instrument_id, message = match.groups()
-            return LogEntry(timestamp, level, instrument_id, message)
-        return None
+            msg_id = match.group("MsgID")
+            timestamp = match.group("TimeStamp")
+            channel = match.group("Channel")
+            log_type = match.group("Type")
+            severity = match.group("Severity")
+            message = match.group("Message")
+            # exception = match.group("Exception")
+
+            return LogEntry(timestamp, severity, "", message, line, msg_id)
+        else:
+            return None
 
     def create_log_chunks(self, log_lines):
         """Group log entries into chunks of 5-10 entries"""
         entries = []
         for line in log_lines:
-            entry = self.parse_log_line(line)
+            entry = self.extract_log_entry(line)
             if entry:
                 entries.append(entry)
 
@@ -83,7 +106,7 @@ class InstrumentLogAnalyzer:
 
         for entry in entries:
             chunk_text.append(
-                f"{entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
+                f"{entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message} - {entry.exception if entry.exception else 'No Exception'}")
             instrument = entry.instrument_id
             if entry.level in ['ERROR', 'WARN']:
                 error_types.add(entry.level)
@@ -104,7 +127,7 @@ class InstrumentLogAnalyzer:
             model="text-embedding-3-small"
         )
 
-        print(f"Response usage: {response.usage}")   
+        # print(f"Response usage: {response.usage}")   
         return response.data[0].embedding
 
 
@@ -147,92 +170,52 @@ def create_search_index():
     print(f"Index '{SEARCH_INDEX_NAME}' created successfully")
 
 
-def add_sample_error_knowledge():
+def add_sample_error_knowledge(filename):
     """Add sample error patterns and their solutions"""
-    sample_errors = [
-        {
-            "id": "temp_sensor_invalid",
-            "log_content": """2024-06-01 10:30:15 [ERROR] TEMP_001: Temperature sensor reading invalid: -999.0°C
-2024-06-01 10:30:16 [WARN] TEMP_001: Sensor calibration check failed
-2024-06-01 10:30:17 [ERROR] TEMP_001: Connection timeout to sensor
-2024-06-01 10:30:18 [ERROR] TEMP_001: Sensor offline
-2024-06-01 10:30:19 [INFO] SYSTEM: Switching to backup temperature sensor
-2024-06-01 10:30:20 [ERROR] TEMP_002: Backup sensor also showing invalid readings
-2024-06-01 10:30:21 [ERROR] SYSTEM: Temperature monitoring compromised""",
-            "solution": "1. Check sensor cable connections\n2. Perform sensor recalibration using procedure TEMP-CAL-001\n3. If issue persists, replace temperature sensor\n4. Verify power supply to sensor module",
-            "instrument": "Fluent 123456 1080",
-            "error_levels": ["ERROR", "WARN"],
-            "severity": "HIGH"
-        },
-        {
-            "id": "pressure_drift",
-            "log_content": """2024-06-01 11:15:30 [WARN] PRESS_001: Pressure reading drift detected: 45.2 PSI (expected 50.0 PSI)
-2024-06-01 11:15:31 [INFO] PRESS_001: Running self-diagnostic
-2024-06-01 11:15:32 [WARN] PRESS_001: Calibration reference out of range
-2024-06-01 11:15:33 [ERROR] PRESS_001: Pressure sensor accuracy compromised
-2024-06-01 11:15:34 [INFO] SYSTEM: Pressure alarm threshold adjusted
-2024-06-01 11:15:35 [WARN] PRESS_001: Sensor requires recalibration""",
-            "solution": "1. Perform pressure sensor recalibration using reference standard\n2. Check for ambient temperature effects on sensor\n3. Inspect sensor diaphragm for damage\n4. Update calibration coefficients in system",
-            "instrument": "Fluent 123456 1080",
-            "error_levels": ["ERROR", "WARN"],
-            "severity": "MEDIUM"
-        },
-        {
-            "id": "flow_blockage",
-            "log_content": """2024-06-01 14:22:10 [WARN] FLOW_001: Flow rate below minimum threshold: 2.1 L/min (min: 5.0 L/min)
-2024-06-01 14:22:11 [ERROR] FLOW_001: Flow sensor reading inconsistent
-2024-06-01 14:22:12 [INFO] PUMP_001: Increasing pump speed to compensate
-2024-06-01 14:22:13 [ERROR] FLOW_001: Flow rate continues to decrease: 1.8 L/min
-2024-06-01 14:22:14 [ERROR] SYSTEM: Flow blockage suspected
-2024-06-01 14:22:15 [ERROR] PUMP_001: Pump pressure exceeded maximum limit
-2024-06-01 14:22:16 [ERROR] SYSTEM: Emergency shutdown activated""",
-            "solution": "1. Check for blockages in flow lines and filters\n2. Inspect pump inlet and outlet connections\n3. Clean or replace flow filters\n4. Verify flow sensor is not obstructed\n5. Check for air bubbles in system",
-            "instrument": "Fluent 123456 1080",
-            "error_levels": ["ERROR", "WARN"],
-            "severity": "HIGH"
-        }
-    ]
 
     analyzer = InstrumentLogAnalyzer()
     documents = []
 
-    for error in sample_errors:
-        # Generate embedding for the log content
-        embedding = analyzer.get_embedding_with_inference_client(error["log_content"])
+    
+    with open(filename, 'r') as file:
+        for line in file:
+            entry = analyzer.extract_log_entry(line)
+            if entry and (entry.level in ['Error']):
+                print(f"{entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
+    
+                # Generate embedding for the log content
+                embedding = analyzer.get_embedding_with_inference_client(entry.message)
 
-        doc = {
-            "id": error["id"],
-            "log_content": error["log_content"],
-            "solution": error["solution"],
-            "start_time": "2024-06-01 00:00:00",  # Would extract from actual logs
-            "end_time": "2024-06-01 23:59:59",
-            "instrument": error["instrument"],
-            "error_levels": error["error_levels"],
-            "severity": error["severity"],
-            "content_vector": embedding
-        }
-        documents.append(doc)
+                doc = {
+                    "id": entry.message_id,
+                    "log_content": entry.full_log_text,
+                    "solution": "",
+                    "start_time": entry.timestamp,  
+                    "end_time": entry.timestamp,
+                    "instrument": "",
+                    "error_levels": [entry.level],
+                    "severity": entry.level,
+                    "content_vector": embedding
+                }
+                documents.append(doc)
 
     result = search_client.upload_documents(documents)
     print(f"Uploaded {len(documents)} error patterns to knowledge base")
 
 
-def find_similar_errors(current_logs, top_k=1):
+def find_similar_errors(log, top_k=1):
     """Find similar error patterns for current log entries"""
     analyzer = InstrumentLogAnalyzer()
 
-    # Create chunk from current logs
-    chunks = analyzer.create_log_chunks(current_logs)
-    if not chunks:
+    log_entry = analyzer.extract_log_entry(log)
+    if not log_entry or log_entry.level not in ['Error']:
         return []
-
-    # Use the first chunk for similarity search
-    current_chunk = chunks[0]
-    current_embedding = analyzer.get_embedding_with_inference_client(current_chunk['content'])
+    
+    log_embedding = analyzer.get_embedding_with_inference_client(log_entry.message)
 
     # Vector search
     vector_query = VectorizedQuery(
-        vector=current_embedding,
+        vector=log_embedding,
         k_nearest_neighbors=top_k,
         fields="content_vector"
     )
@@ -247,55 +230,56 @@ def find_similar_errors(current_logs, top_k=1):
     return list(results)
 
 
-def suggest_solution(current_logs):
+def suggest_solution(log):
     """Main function to suggest solutions for current error logs"""
-    print("Analyzing current error logs...")
-    print("="*60)
 
-    # Display current logs
-    for i, log in enumerate(current_logs[:5], 1):  # Show first 5 lines
-        print(f"{i}. {log.strip()}")
-    if len(current_logs) > 5:
-        print(f"... and {len(current_logs)-5} more entries")
-
-    print("\nSearching for similar error patterns...")
-    print("-"*60)
-
-    # Find similar errors
-    similar_errors = find_similar_errors(current_logs)
+    similar_errors = find_similar_errors(log)
 
     if not similar_errors:
         return "No similar error patterns found in knowledge base."
 
-    # Display results
-    best_match = similar_errors[0]
-    confidence = best_match.get('@search.score', 0)
+    results = []
 
-    print(f"Best Match (Confidence: {confidence:.3f}):")
-    print(f"Severity: {best_match['severity']}")
-    print(f"Affected Instrument: {best_match['instrument']}")
-    print("\nRecommended Solution:")
-    print(best_match['solution'])
+    for i, error in enumerate(similar_errors):
+        confidence = error.get('@search.score', 0)
+        best_match = {
+            'severity': error['severity'],
+            'log_content': error['log_content'] if 'log_content' in error else ''
+        }
+        results.append({
+            'confidence': confidence,
+            'severity': best_match['severity'],
+            'signature log': best_match['log_content']
+        })   
 
-    return best_match['solution']
+    return results
 
+def parse_log(filename):
+    """Parse log file and return list of log lines"""
+    analyser = InstrumentLogAnalyzer()
+    with open(filename, 'r') as file:
+        n = 1
+        for line in file:
+            entry = analyser.extract_log_entry(line)
+            if entry and (entry.level in ['Error']):
+                print(f"{n}. {entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
+            n += 1
+            
 
-# Example usage
 if __name__ == "__main__":
+    analyser = InstrumentLogAnalyzer()
+    with open(LOG_FILE, 'r') as file:
+        for line in file:
+            entry = analyser.extract_log_entry(line)
+            if entry and (entry.level in ['Error']):
+                signature_matches = suggest_solution(entry.full_log_text)
+                if signature_matches:
+                    for match in signature_matches:
+                        print(f"\nCurrent Error {entry.message_id}:\n{line}Matched Signature Confidence: {match['confidence']}, Severity: {match['severity']}, Log:\n{match['signature log']}")
+                else:
+                    print(f"\nCurrent Error {entry.message_id}:\n{line}No signature matches found")
+                    
     # Setup (run once)
     # create_search_index()
     # add_sample_error_knowledge()
-
-    # Simulate current error logs
-    current_error_logs = [
-        # "2024-06-01 15:45:10 [ERROR] TEMP_003: Temperature sensor reading invalid: -999.0°C",
-        "2024-06-01 15:45:11 [WARN] TEMP_003: Sensor connection unstable",
-        "2024-06-01 15:45:12 [ERROR] TEMP_003: Calibration data corrupted",
-        "2024-06-01 15:45:13 [ERROR] TEMP_003: Sensor communication lost",
-        "2024-06-01 15:45:14 [INFO] SYSTEM: Attempting sensor reset",
-        "2024-06-01 15:45:15 [ERROR] TEMP_003: Reset failed - sensor unresponsive",
-        "2024-06-01 15:45:16 [ERROR] SYSTEM: Temperature monitoring offline"
-    ]
-
-    # Get solution suggestion
-    solution = suggest_solution(current_error_logs)
+    
