@@ -17,6 +17,8 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 SEARCH_INDEX_NAME = os.getenv("SEARCH_INDEX_NAME", "log-file-errors")
 LOG_FILE = os.getenv("LOG_FILE")
+SAMPLE_FILES = os.getenv("SAMPLE_FILES")
+SAMPLE_FILES_FOLDER = os.getenv("SAMPLE_FILES_FOLDER")
 
 # Validate required environment variables
 if not AZURE_SEARCH_KEY:
@@ -175,13 +177,12 @@ def add_sample_error_knowledge(filename):
 
     analyzer = InstrumentLogAnalyzer()
     documents = []
-
     
     with open(filename, 'r') as file:
         for line in file:
             entry = analyzer.extract_log_entry(line)
             if entry and (entry.level in ['Error']):
-                print(f"{entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
+                # print(f"{entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
     
                 # Generate embedding for the log content
                 embedding = analyzer.get_embedding_with_inference_client(entry.message)
@@ -199,8 +200,9 @@ def add_sample_error_knowledge(filename):
                 }
                 documents.append(doc)
 
-    result = search_client.upload_documents(documents)
-    print(f"Uploaded {len(documents)} error patterns to knowledge base")
+    if len(documents) > 0:
+        result = search_client.upload_documents(documents)
+        print(f"Uploaded {len(result)} error patterns to knowledge base")
 
 
 def find_similar_errors(log, top_k=1):
@@ -264,11 +266,25 @@ def parse_log(filename):
             if entry and (entry.level in ['Error']):
                 print(f"{n}. {entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
             n += 1
-            
 
-if __name__ == "__main__":
+
+def get_filenames_in_folder(folder):
+    # A list to store full paths of all files
+    extracted_files = []
+
+    # Walk through the given folder and its subfolders
+    for root, dirs, files in os.walk(folder):
+        for file in files:
+            # Add the full path of the file to the list
+            full_path = os.path.join(root, file)
+            extracted_files.append(full_path)
+
+    return extracted_files
+
+
+def find_matches(filename):
     analyser = InstrumentLogAnalyzer()
-    with open(LOG_FILE, 'r') as file:
+    with open(filename, 'r') as file:
         for line in file:
             entry = analyser.extract_log_entry(line)
             if entry and (entry.level in ['Error']):
@@ -278,8 +294,15 @@ if __name__ == "__main__":
                         print(f"\nCurrent Error {entry.message_id}:\n{line}Matched Signature Confidence: {match['confidence']}, Severity: {match['severity']}, Log:\n{match['signature log']}")
                 else:
                     print(f"\nCurrent Error {entry.message_id}:\n{line}No signature matches found")
-                    
+    
+    
+if __name__ == "__main__":
     # Setup (run once)
     # create_search_index()
-    # add_sample_error_knowledge()
+    
+    #  SAMPLE_FILES.split(',')
+    # for sample_file in get_filenames_in_folder(SAMPLE_FILES_FOLDER):
+    #     add_sample_error_knowledge(sample_file)
+    
+    find_matches(LOG_FILE)                
     
