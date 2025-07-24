@@ -1,5 +1,5 @@
 # Set the folder path where the files are located
-$folderPath = "\\wsl.localhost\Ubuntu\home\nzigopis\repos\python\remote-diagnostics\logs.\Fluent~2211017808.780"
+$folderPath = "\\wsl.localhost\Ubuntu\home\nzigopis\repos\python\remote-diagnostics\logs.\Fluent~1610007591.1080"
 
 # Get all the .zlf files in the folder
 $files = Get-ChildItem -Path $folderPath -Filter "*.zlf"

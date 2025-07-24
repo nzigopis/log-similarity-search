@@ -39,24 +39,27 @@ client = EmbeddingsClient(
     credential=AzureKeyCredential(AZURE_OPENAI_KEY)
 )
 
+message_db = {}
+
 class LogEntry:
-    def __init__(self, timestamp, level, instrument_id, message, full_log_text, message_id):
+    def __init__(self, timestamp, level, instrument_id, message, full_log_text, message_id, channel, log_type):
         self.timestamp = timestamp
         self.level = level
         self.instrument_id = instrument_id
         self.message = message
         self.full_log_text = full_log_text
         self.message_id = message_id
+        self.channel = channel
+        self.log_type = log_type
 
-
-class InstrumentLogAnalyzer:
-    def __init__(self):
-        self.chunk_size = 1  # log entries per chunk
-
-    def extract_log_entry(self, line):
-        """Parse individual log line into structured format"""
+    def get_text_to_embed(self):
+        """Generate text to embed for this log entry"""
         
-        pattern = (
+        normalized_message = normalize_message(self.message[0:200])
+        text_to_embed = f"{self.channel}, {self.log_type}, {self.level}, {normalized_message}"
+        return text_to_embed
+    
+pattern = (
             r'MsgID="(?P<MsgID>[^"]+)"\s+' 
             r'TimeStamp="(?P<TimeStamp>[^"]+)"\s+'  # TimeStamp field
             r'Channel="(?P<Channel>[^"]+)"\s+'      # Channel field
@@ -68,70 +71,37 @@ class InstrumentLogAnalyzer:
             # r'Message="(?P<Message>[^"]+.[^<]*)"\s*' # Message field up to <Exception>
             # r'<Exception>\s*<!\[CDATA\[(?P<Exception>.*?)\]\]>'  # Exception block
         )
+
+def extract_log_entry(line):
+    """Parse individual log line into structured format"""
         
-        match = re.search(pattern, line, re.DOTALL)
+    global pattern
+        
+    match = re.search(pattern, line, re.DOTALL)
 
-        if match:
-            msg_id = match.group("MsgID")
-            timestamp = match.group("TimeStamp")
-            channel = match.group("Channel")
-            log_type = match.group("Type")
-            severity = match.group("Severity")
-            message = match.group("Message")
-            # exception = match.group("Exception")
+    if match:
+        msg_id = match.group("MsgID")
+        timestamp = match.group("TimeStamp")
+        channel = match.group("Channel")
+        log_type = match.group("Type")
+        severity = match.group("Severity")
+        message = match.group("Message")
+        # exception = match.group("Exception")
 
-            return LogEntry(timestamp, severity, "", message, line, msg_id)
-        else:
-            return None
-
-    def create_log_chunks(self, log_lines):
-        """Group log entries into chunks of 5-10 entries"""
-        entries = []
-        for line in log_lines:
-            entry = self.extract_log_entry(line)
-            if entry:
-                entries.append(entry)
-
-        chunks = []
-        for i in range(0, len(entries), self.chunk_size):
-            chunk_entries = entries[i:i + self.chunk_size]
-            if chunk_entries:
-                chunks.append(self.format_chunk(chunk_entries))
-
-        return chunks
-
-    def format_chunk(self, entries):
-        """Format chunk of log entries with metadata"""
-        chunk_text = []
-        instrument = ""
-        error_types = set()
-
-        for entry in entries:
-            chunk_text.append(
-                f"{entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message} - {entry.exception if entry.exception else 'No Exception'}")
-            instrument = entry.instrument_id
-            if entry.level in ['ERROR', 'WARN']:
-                error_types.add(entry.level)
-
-        return {
-            'content': '\n'.join(chunk_text),
-            'start_time': entries[0].timestamp,
-            'end_time': entries[-1].timestamp,
-            'instrument': instrument,
-            'error_levels': list(error_types),
-            'entry_count': len(entries)
-        }
-
-    def get_embedding_with_inference_client(self, text):
-        """Generate embedding for text chunk"""
-        response = client.embed(
-            input=[text],
-            model="text-embedding-3-small"
+        return LogEntry(timestamp, severity, "", message, line, msg_id, channel, log_type)
+    else:
+        return None
+        
+def get_embedding_with_inference_client(text):
+    """Generate embedding for text chunk"""
+    response = client.embed(
+        input=[text],
+        model="text-embedding-3-small"
         )
 
-        # print(f"Response usage: {response.usage}")   
-        return response.data[0].embedding
-
+    # print(f"Response usage: {response.usage}")   
+    return response.data[0].embedding
+    
 
 def create_search_index():
     """Create search index for instrument error logs"""
@@ -144,6 +114,7 @@ def create_search_index():
     fields = [
         SimpleField(name="id", type=SearchFieldDataType.String, key=True),
         SearchableField(name="log_content", type=SearchFieldDataType.String),
+        SearchableField(name="embedded_content", type=SearchFieldDataType.String),
         SearchableField(name="solution", type=SearchFieldDataType.String),
         SimpleField(name="start_time", type=SearchFieldDataType.String),
         SimpleField(name="end_time", type=SearchFieldDataType.String),
@@ -172,33 +143,66 @@ def create_search_index():
     print(f"Index '{SEARCH_INDEX_NAME}' created successfully")
 
 
-def add_sample_error_knowledge(filename):
+def normalize_message(message):
+    message = re.sub(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b', 'GUID', message)
+    # replace IP addresses with the word "IP"
+    message = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', 'IP', message)
+    # replace email addresses with the word "EMAIL"
+    message = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', 'EMAIL', message)
+    # replace file paths with the word "FILEPATH"
+    message = re.sub(r'([a-zA-Z]:)?(\\[a-zA-Z0-9._-]+)+\\?', 'FILEPATH', message)
+    # replace URLs with the word "URL"
+    message = re.sub(r'https?://[^\s]+', 'URL', message)
+    # replace phone numbers with the word "PHONE"
+    message = re.sub(r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b', 'PHONE', message)
+    # replace dates with the word "DATE"
+    message = re.sub(r'\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b', 'DATE', message)
+    # replace times with the word "TIME"
+    message = re.sub(r'\b\d{1,2}:\d{2}:\d{2}\b', 'TIME', message)
+    
+    return message
+    
+def add_sample_error_knowledge(instrument_id, filename):
     """Add sample error patterns and their solutions"""
 
-    analyzer = InstrumentLogAnalyzer()
     documents = []
     
     with open(filename, 'r') as file:
         for line in file:
-            entry = analyzer.extract_log_entry(line)
-            if entry and (entry.level in ['Error']):
+            entry = extract_log_entry(line)
+            if entry and (entry.level in ['Error', 'Warning']):
                 # print(f"{entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
     
+                id_safe = re.sub(r'[^a-zA-Z0-9]', '-', f"{instrument_id}:{entry.message_id}:{entry.timestamp}")
+                
                 # Generate embedding for the log content
-                embedding = analyzer.get_embedding_with_inference_client(entry.message)
+                normalized_message = normalize_message(entry.message[0:200])
+                if normalized_message in message_db:
+                    # print(f"Skipping duplicate message: {normalized_message}")
+                    continue
+                
+                message_db[normalized_message] = True
+                
+                text_to_embed = entry.get_text_to_embed()
+                
+                # f"{entry.channel}, {entry.log_type}, {entry.level}, {normalized_message}"
+                embedding = get_embedding_with_inference_client(text_to_embed)
 
                 doc = {
-                    "id": entry.message_id,
+                    "id": id_safe,
                     "log_content": entry.full_log_text,
+                    "embedded_content": text_to_embed,
                     "solution": "",
                     "start_time": entry.timestamp,  
                     "end_time": entry.timestamp,
-                    "instrument": "",
+                    "instrument": instrument_id,
                     "error_levels": [entry.level],
                     "severity": entry.level,
                     "content_vector": embedding
                 }
+                # print(f"Adding error/warning pattern: {normalized_message}")
                 documents.append(doc)
+                # print(text_to_embed)
 
     if len(documents) > 0:
         result = search_client.upload_documents(documents)
@@ -207,13 +211,11 @@ def add_sample_error_knowledge(filename):
 
 def find_similar_errors(log, top_k=1):
     """Find similar error patterns for current log entries"""
-    analyzer = InstrumentLogAnalyzer()
-
-    log_entry = analyzer.extract_log_entry(log)
-    if not log_entry or log_entry.level not in ['Error']:
-        return []
+    log_entry = extract_log_entry(log)
+    # if not log_entry or log_entry.level not in ['Error']:
+    #     return []
     
-    log_embedding = analyzer.get_embedding_with_inference_client(log_entry.message)
+    log_embedding = get_embedding_with_inference_client(log_entry.get_text_to_embed())
 
     # Vector search
     vector_query = VectorizedQuery(
@@ -232,10 +234,10 @@ def find_similar_errors(log, top_k=1):
     return list(results)
 
 
-def suggest_solution(log):
+def suggest_solution(log, top_k=1):
     """Main function to suggest solutions for current error logs"""
 
-    similar_errors = find_similar_errors(log)
+    similar_errors = find_similar_errors(log, top_k)
 
     if not similar_errors:
         return "No similar error patterns found in knowledge base."
@@ -256,17 +258,6 @@ def suggest_solution(log):
 
     return results
 
-def parse_log(filename):
-    """Parse log file and return list of log lines"""
-    analyser = InstrumentLogAnalyzer()
-    with open(filename, 'r') as file:
-        n = 1
-        for line in file:
-            entry = analyser.extract_log_entry(line)
-            if entry and (entry.level in ['Error']):
-                print(f"{n}. {entry.timestamp} [{entry.level}] {entry.instrument_id}: {entry.message}")
-            n += 1
-
 
 def get_filenames_in_folder(folder):
     # A list to store full paths of all files
@@ -282,16 +273,16 @@ def get_filenames_in_folder(folder):
     return extracted_files
 
 
-def find_matches(filename):
-    analyser = InstrumentLogAnalyzer()
+def find_matches(filename, top_k=1):
     with open(filename, 'r') as file:
         for line in file:
-            entry = analyser.extract_log_entry(line)
-            if entry and (entry.level in ['Error']):
-                signature_matches = suggest_solution(entry.full_log_text)
+            entry = extract_log_entry(line)
+            if entry and (entry.level in ['Error', 'Warning']):
+                signature_matches = suggest_solution(entry.full_log_text, top_k)
                 if signature_matches:
-                    for match in signature_matches:
-                        print(f"\nCurrent Error {entry.message_id}:\n{line}Matched Signature Confidence: {match['confidence']}, Severity: {match['severity']}, Log:\n{match['signature log']}")
+                    matches = [f"Confidence: {match['confidence']},{match['signature log']}" for match in signature_matches]
+                    matches_string = ''.join(matches)
+                    print(f"{line}->\n{matches_string}")
                 else:
                     print(f"\nCurrent Error {entry.message_id}:\n{line}No signature matches found")
     
@@ -302,7 +293,14 @@ if __name__ == "__main__":
     
     #  SAMPLE_FILES.split(',')
     # for sample_file in get_filenames_in_folder(SAMPLE_FILES_FOLDER):
-    #     add_sample_error_knowledge(sample_file)
+    #     if not sample_file.endswith('.ulf'):
+    #         continue
+    #     print(f"Adding log file to search index: {sample_file}")
+    #     parts = sample_file.split('/')
+    #     # sample_file = parts[-1] if len(parts) > 0 else sample_file
+    #     instrumentid = parts[-2] if len(parts) > 1 else 'unknown'
+        
+    #     add_sample_error_knowledge(instrumentid, sample_file)
     
-    find_matches(LOG_FILE)                
+    find_matches(LOG_FILE, 3)                
     
